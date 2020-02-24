@@ -4,9 +4,7 @@ import domain.Message
 import domain.utils.MessageSerializer
 import kotlinx.coroutines.*
 import java.io.BufferedWriter
-import java.lang.Exception
 import java.net.Socket
-import java.net.SocketException
 
 class Client {
 
@@ -18,18 +16,18 @@ class Client {
     private val messageSerializer = MessageSerializer()
 
     init {
-        print("Enter your username: ")
+        println("Enter your username: ")
         name = readLine() ?: "Unkwnown user"
     }
 
     suspend fun connect(address: String, port: Int) = coroutineScope {
-        println("Ожидание соединения...")
+        println("Waiting for connection...")
         try {
             socket = prepareServerSocket(address, port, 10000)
-                .also { println("Соединение установлено") }
+                .also { println("Connection established") }
 
         } catch (e: TimeoutCancellationException) {
-            print("Время ожидания сервера истекло")
+            print("Server timeout exceeded")
             return@coroutineScope
         }
 
