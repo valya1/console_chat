@@ -2,7 +2,7 @@ package domain.client
 
 class ClientMessageHandler {
 
-    suspend operator fun invoke(text: String): Result = when (text) {
+    operator fun invoke(text: String): Result = when (text) {
         CLOSE_CONNECTION -> Result.CloseConnection
         else -> Result.Message(text)
     }
