@@ -2,9 +2,10 @@ package domain.server
 
 import domain.Message
 import domain.room.Room
-import domain.sharedEntities.ClientInfo
+import domain.sharedEntities.Connection
 import domain.utils.MessageSerializer
 import kotlinx.coroutines.*
+import java.io.File
 import java.lang.Exception
 import java.lang.NullPointerException
 import java.net.ServerSocket
@@ -20,7 +21,7 @@ class Server(port: Int) {
 
     private val chatsScope = CoroutineScope(Job())
 
-    private val dateFormatter = SimpleDateFormat("dd:MM:yyyy HH:mm:ss")
+    private val dateFormatter = SimpleDateFormat("dd.MM.yyyy HH:mm:ss")
 
     private val rooms = hashMapOf<String, Room>()
     private val usersAndRooms = mutableMapOf<String, Room?>()
@@ -30,10 +31,13 @@ class Server(port: Int) {
         launch { awaitClientConnections() }
     }
 
-    private fun awaitClientConnections() {
+    private suspend fun awaitClientConnections() {
         while (true) {
-            val clientInfo = getClient()
-            proceedClient(clientInfo)
+            when (val connection = getConnection()) {
+                is Connection.UserConnection -> proceedClient(connection)
+                is Connection.UploadConnection -> uploadFile(connection)
+                is Connection.DownloadConnection -> downloadFile(connection)
+            }
         }
     }
 
@@ -46,7 +50,7 @@ class Server(port: Int) {
         }
     }
 
-    private fun proceedClient(clientInfo: ClientInfo) {
+    private suspend fun proceedClient(clientInfo: Connection.UserConnection) {
         if (usersAndRooms.containsKey(clientInfo.userName)) {
             rejectUser(clientInfo)
         } else {
@@ -58,12 +62,12 @@ class Server(port: Int) {
         }
     }
 
-    private fun rejectUser(clientInfo: ClientInfo) {
+    private fun rejectUser(clientInfo: Connection.UserConnection) {
         clientInfo.socket.sendMessage(Message(SERVER, USER_EXISTS_MESSAGE))
         clientInfo.socket.close()
     }
 
-    private fun createNewRoom(clientInfo: ClientInfo, roomName: String) {
+    private fun createNewRoom(clientInfo: Connection.UserConnection, roomName: String) {
 
         if (rooms.containsKey(roomName)) {
             clientInfo.socket.sendMessage(Message(SERVER, "Room $roomName already exists"))
@@ -75,12 +79,20 @@ class Server(port: Int) {
         }
     }
 
-    private fun connectClientIntoRoom(clientInfo: ClientInfo, roomName: String) {
+    private fun connectClientIntoRoom(clientInfo: Connection.UserConnection, roomName: String) {
+
+        if (usersAndRooms[clientInfo.userName] != null) {
+            clientInfo.socket.sendMessage(Message(SERVER, "You are already connected to room $roomName"))
+            return
+        }
+
         rooms[roomName]?.let { room ->
             room.clients[clientInfo.userName] = clientInfo.socket
             usersAndRooms[clientInfo.userName] = room
             sendBroadcast(BroadcastEvent.NewUserConnected(clientInfo.userName), room.name)
-        }
+            clientInfo.socket.sendMessage(Message(SERVER, "You have successfully connected to room $roomName"))
+        } ?: clientInfo.socket.sendMessage(Message(SERVER, "Room $roomName does not exist"))
+
     }
 
     private fun Socket.sendMessage(message: Message) {
@@ -114,7 +126,7 @@ class Server(port: Int) {
         }
     }
 
-    private suspend fun listenClient(clientInfo: ClientInfo) = withContext(Dispatchers.IO) {
+    private suspend fun listenClient(clientInfo: Connection.UserConnection) = withContext(Dispatchers.IO) {
         clientInfo.socket.getInputStream()
             .bufferedReader()
             .use {
@@ -135,7 +147,9 @@ class Server(port: Int) {
 
     private fun getClientsInRoom(roomName: String): Set<String> = rooms[roomName]?.clients?.keys ?: setOf()
 
-    private fun onUserDisconnected(clientInfo: ClientInfo) {
+    private fun getAllClients(): Set<String> = usersAndRooms.keys
+
+    private fun onUserDisconnected(clientInfo: Connection.UserConnection) {
 
         usersAndRooms[clientInfo.userName]?.let { room ->
             sendBroadcast(BroadcastEvent.UserDisconnected(clientInfo.userName), room.name)
@@ -145,7 +159,7 @@ class Server(port: Int) {
         usersAndRooms.remove(clientInfo.userName)
     }
 
-    private fun handleClientMessage(clientInfo: ClientInfo, message: Message) {
+    private fun handleClientMessage(clientInfo: Connection.UserConnection, message: Message) {
 
         println("Message received: $message")
 
@@ -158,13 +172,16 @@ class Server(port: Int) {
         }
     }
 
-    private fun handleClientCommand(clientInfo: ClientInfo, message: Message): Boolean {
+    private fun handleClientCommand(clientInfo: Connection.UserConnection, message: Message): Boolean {
 
         when (val command = serverCommandsHandler(message.textData)) {
             is ServerCommandsHandler.Result.UnknownCommand -> return false
             is ServerCommandsHandler.Result.CreateRoom -> createNewRoom(clientInfo, command.roomName)
             is ServerCommandsHandler.Result.JoinRoom -> connectClientIntoRoom(clientInfo, command.roomName)
             is ServerCommandsHandler.Result.QuitRoom -> quitRoom(clientInfo)
+            is ServerCommandsHandler.Result.GetAllCLients -> clientInfo.socket.sendMessage(
+                Message(SERVER, getAllClients().joinToString(", "))
+            )
             is ServerCommandsHandler.Result.GetClientsListInRoom ->
                 clientInfo.socket.sendMessage(
                     Message(SERVER, getClientsInRoom(command.roomName).joinToString(", "))
@@ -173,9 +190,69 @@ class Server(port: Int) {
         return true
     }
 
-    private fun quitRoom(clientInfo: ClientInfo) {
 
-        val room = rooms.values.find { room -> room.clients.containsKey(clientInfo.userName) }
+    private suspend fun uploadFile(uploadConnection: Connection.UploadConnection) = withContext(Dispatchers.IO) {
+        val uploadSocket = uploadConnection.socket
+        val room = usersAndRooms[uploadConnection.userName]
+        val user = usersAndRooms[uploadConnection.userName]
+            ?.clients
+            ?.get(uploadConnection.userName)
+        val file = File("Uploadings", uploadConnection.fileName)
+
+        if (room == null || user == null) {
+            uploadSocket.close()
+            return@withContext
+        }
+
+        file.createNewFile()
+
+        try {
+            uploadSocket.getInputStream()
+                .use { it.copyTo(file.outputStream()) }
+
+            room.fileNames.add(file.name)
+
+        } catch (e: Exception) {
+            user.sendMessage(Message(SERVER, "Error occured while uploading ${uploadConnection.fileName}, try again"))
+        }
+    }
+
+    private suspend fun downloadFile(downloadConnection: Connection.DownloadConnection) = withContext(Dispatchers.IO) {
+        val downloadSocket = downloadConnection.socket
+        val room = usersAndRooms[downloadConnection.userName]
+        val user = usersAndRooms[downloadConnection.userName]
+            ?.clients
+            ?.get(downloadConnection.userName)
+
+        if (room == null || user == null) {
+            downloadSocket.close()
+            return@withContext
+        }
+
+        try {
+            val file = File("Uploadings", downloadConnection.fileName)
+            if (!file.exists() || !room.fileNames.contains(downloadConnection.fileName)) {
+                throw FileDoesNotExistingException(downloadConnection.fileName)
+            }
+
+            downloadSocket.getOutputStream().use { outputStream ->
+                file.inputStream().use { inputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+        } catch (e: Exception) {
+            user.sendMessage(
+                Message(
+                    SERVER,
+                    "Error occured while downloading ${downloadConnection.fileName}, try again"
+                )
+            )
+        }
+    }
+
+    private fun quitRoom(clientInfo: Connection.UserConnection) {
+
+        val room = usersAndRooms[clientInfo.userName]
 
         if (room == null) {
             clientInfo.socket.sendMessage(Message(SERVER, "You are not connected to any room"))
@@ -188,10 +265,26 @@ class Server(port: Int) {
         sendBroadcast(BroadcastEvent.UserDisconnected(clientInfo.userName), room.name)
     }
 
-    private fun getClient(): ClientInfo {
+    private fun getConnection(): Connection {
         val socket = serverSocket.accept()
-        val roomName = socket.getInputStream().bufferedReader().readLine()!!
-        return ClientInfo(roomName, socket)
+        val reader = socket.getInputStream().bufferedReader()
+        val handshakeMessage = reader.readLine()!!
+
+        val splittedMessage = handshakeMessage.split(" ")
+
+        return when {
+            handshakeMessage.startsWith("/send") -> {
+                Connection.UploadConnection(splittedMessage[1], splittedMessage[2], socket)
+            }
+
+            handshakeMessage.startsWith("/download") -> {
+                val userName = splittedMessage[1]
+                val fileName = splittedMessage[2]
+                Connection.DownloadConnection(userName, fileName, socket)
+            }
+
+            else -> Connection.UserConnection(handshakeMessage, socket)
+        }
     }
 
     private fun String.toMessage(): Message = Message(SERVER, this)
@@ -210,4 +303,6 @@ class Server(port: Int) {
         class NewMessage(intendedUserName: String, val message: Message) :
             BroadcastEvent(intendedUserName, System.currentTimeMillis())
     }
+
+    class FileDoesNotExistingException(fileName: String) : Exception("File $fileName does not existing in this room")
 }
